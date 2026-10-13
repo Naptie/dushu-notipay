@@ -1,0 +1,8 @@
+{
+  "napcatWs": "ws://127.0.0.1:3001",
+  "napcatToken": "your_napcat_token",
+  "encryptionKey": "your_encryption_key_64_hex_chars",
+  "commandNames": ["dushu-notipay", "dnp"],
+  "billingRetryCount": 3,
+  "apiBaseUrl": "https://api.215123.cn"
+}

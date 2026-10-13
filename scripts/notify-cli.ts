@@ -1,0 +1,152 @@
+#!/usr/bin/env node
+/**
+ * Notification Management CLI
+ * Usage: pnpm notify-cli <command> [args]
+ */
+
+import { scheduler, db } from '../src/core/database.js';
+
+const commands = {
+  list: () => {
+    const notifications = scheduler.getAllNotifications();
+    console.log(`\nTotal notifications: ${notifications.length}\n`);
+    console.log('ID\tType\tChat ID\t\tQQ ID\t\tHour\tThreshold');
+    console.log('─'.repeat(100));
+    notifications.forEach((n) => {
+      const thresholdStr =
+        n.threshold !== null && n.threshold !== undefined ? n.threshold.toString() : 'none';
+      console.log(
+        `${n.id}\t${n.chat_type}\t${n.chat_id}\t${n.qq_id}\t${n.hour}:00\t${thresholdStr}`
+      );
+    });
+    console.log();
+  },
+
+  count: () => {
+    const count = scheduler.getNotificationCount();
+    console.log(`\nTotal notifications: ${count}\n`);
+  },
+
+  get: (chatType: string, chatId: string, qqId: string) => {
+    if (!chatType || !chatId || !qqId) {
+      console.error('Usage: get <chat_type> <chat_id> <qq_id>');
+      return;
+    }
+    if (chatType !== 'private' && chatType !== 'group') {
+      console.error('chat_type must be "private" or "group"');
+      return;
+    }
+    const notification = scheduler.getNotification(chatType as 'private' | 'group', chatId, qqId);
+    if (notification) {
+      console.log('\nNotification:');
+      console.log(JSON.stringify(notification, null, 2));
+      console.log();
+    } else {
+      console.log(`\nNo notification found.\n`);
+    }
+  },
+
+  add: (chatType: string, chatId: string, qqId: string, hour: string, threshold?: string) => {
+    if (!chatType || !chatId || !qqId || !hour) {
+      console.error('Usage: add <chat_type> <chat_id> <qq_id> <hour> [threshold]');
+      return;
+    }
+    if (chatType !== 'private' && chatType !== 'group') {
+      console.error('chat_type must be "private" or "group"');
+      return;
+    }
+    const hourNum = parseInt(hour);
+    if (isNaN(hourNum) || hourNum < 0 || hourNum > 23) {
+      console.error('hour must be between 0 and 23');
+      return;
+    }
+
+    let thresholdNum: number | undefined;
+    if (threshold !== undefined) {
+      thresholdNum = parseFloat(threshold);
+      if (isNaN(thresholdNum) || thresholdNum < 0) {
+        console.error('threshold must be a non-negative number');
+        return;
+      }
+    }
+
+    const notification = scheduler.setNotification(
+      chatType as 'private' | 'group',
+      chatId,
+      qqId,
+      hourNum,
+      thresholdNum
+    );
+    console.log('\nNotification added/updated:');
+    console.log(JSON.stringify(notification, null, 2));
+    console.log();
+  },
+
+  delete: (chatType: string, chatId: string, qqId: string) => {
+    if (!chatType || !chatId || !qqId) {
+      console.error('Usage: delete <chat_type> <chat_id> <qq_id>');
+      return;
+    }
+    if (chatType !== 'private' && chatType !== 'group') {
+      console.error('chat_type must be "private" or "group"');
+      return;
+    }
+    const deleted = scheduler.deleteNotification(chatType as 'private' | 'group', chatId, qqId);
+    if (deleted) {
+      console.log('\nNotification deleted.\n');
+    } else {
+      console.log('\nNo notification found.\n');
+    }
+  },
+
+  backup: (path?: string) => {
+    const backupPath = path || `data-backup-${Date.now()}.db`;
+    db.backup(backupPath);
+    console.log(`\nDatabase backed up to: ${backupPath}\n`);
+  },
+
+  help: () => {
+    console.log(`
+Notification Management CLI
+
+Commands:
+  list                                    List all notifications
+  count                                   Show total notification count
+  get <chat_type> <chat_id> <qq_id>       Get notification details
+  add <chat_type> <chat_id> <qq_id>       Add/update notification
+      <hour> [threshold]
+  delete <chat_type> <chat_id> <qq_id>    Delete notification
+  backup [path]                           Backup database
+  help                                    Show this help message
+
+Chat Types: private, group
+
+Parameters:
+  hour       - Hour of day (0-23) to send notification
+  threshold  - Optional balance threshold. If set, the notification
+               will only be sent when any room balance drops below it.
+
+Examples:
+  pnpm notify-cli list
+  pnpm notify-cli add private 123456789 123456789 8
+  pnpm notify-cli add private 123456789 123456789 8 50
+  pnpm notify-cli add group 987654321 123456789 20
+  pnpm notify-cli delete private 123456789 123456789
+`);
+  }
+};
+
+const [, , command, ...args] = process.argv;
+
+if (!command || command === 'help' || !(command in commands)) {
+  commands.help();
+} else {
+  try {
+    const cmd = commands[command as keyof typeof commands] as (...args: string[]) => void;
+    cmd(...args);
+  } catch (error) {
+    console.error('Error:', error);
+  } finally {
+    db.close();
+  }
+}

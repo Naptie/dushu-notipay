@@ -1,0 +1,34 @@
+# deps
+node_modules/
+
+# build
+dist/
+
+# env
+.env
+.env.production
+
+# secrets
+config.json
+
+# database
+*.db
+*.db-shm
+*.db-wal
+backups/
+
+# logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# misc
+.DS_Store
+deploy.sh
+
+# chart harness output
+tmp/
