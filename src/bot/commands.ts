@@ -242,8 +242,8 @@ const handleQuery = async ({ command, params, qqId, send }: CommandContext): Pro
     return;
   }
 
-  // Fetch fresh balances (also records history)
-  const collected = await collectUserData(user);
+  // Fetch fresh balances without changing scheduled history or fetch timing.
+  const collected = await collectUserData(user, { persist: false });
   if (!collected.success) {
     await send(`查询失败：${collected.error?.message ?? '未知错误'}`);
     return;

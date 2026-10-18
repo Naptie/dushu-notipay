@@ -25,7 +25,11 @@ export interface CollectedData {
  * Fetch fresh balances for every room bound to a user, recording each value
  * into the billing history. Handles token minting/refresh automatically.
  */
-export const collectUserData = async (user: UserPublic): Promise<CollectedData> => {
+export const collectUserData = async (
+  user: UserPublic,
+  options: { persist?: boolean } = {}
+): Promise<CollectedData> => {
+  const persist = options.persist ?? true;
   const rooms = db.getRooms(user.qq_id);
   if (rooms.length === 0) {
     return {
@@ -42,7 +46,9 @@ export const collectUserData = async (user: UserPublic): Promise<CollectedData> 
       const results: CollectedRoom[] = [];
       for (const room of rooms) {
         const balance = await getRoomBalance(token, room.apartment_id, room.room_uid);
-        db.addBillingHistory(user.qq_id, room.room_uid, balance, room.room_label ?? undefined);
+        if (persist) {
+          db.addBillingHistory(user.qq_id, room.room_uid, balance, room.room_label ?? undefined);
+        }
         results.push({
           roomUid: room.room_uid,
           roomLabel: room.room_label ?? room.room_uid,
@@ -52,7 +58,9 @@ export const collectUserData = async (user: UserPublic): Promise<CollectedData> 
       return results;
     });
 
-    db.updateLastLogin(user.qq_id);
+    if (persist) {
+      db.updateLastLogin(user.qq_id);
+    }
     console.log(
       `[Scheduler] Collected data for ${user.name || user.qq_id} (${collected.length} rooms)`
     );
@@ -84,7 +92,9 @@ export const collectData = async (
       `[Scheduler] Processing batch ${Math.floor(i / batchSize) + 1}/${Math.ceil(users.length / batchSize)} (${batch.length} users)`
     );
 
-    const batchResults = await Promise.all(batch.map((user) => collectUserData(user)));
+    const batchResults = await Promise.all(
+      batch.map((user) => collectUserData(user, { persist: true }))
+    );
     results.push(...batchResults);
 
     // Small delay between batches to avoid overwhelming the server
