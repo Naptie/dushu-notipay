@@ -76,6 +76,22 @@ export const dailyUpdateMoment = (now: Date, hour: number): Date => {
 };
 
 /**
+ * The most recent daily slot at or before `now`.
+ *
+ * A reading belongs to the slot it closes. The billing system refreshes
+ * around 08:00-09:00, so a reading taken before the daily hour (e.g. 03:00)
+ * still closes the previous day - it captures that day's evening usage - and
+ * is therefore attributed to the previous day's slot.
+ */
+export const lastDailySlot = (now: Date, hour: number): Date => {
+  const moment = dailyUpdateMoment(now, hour);
+  if (moment.getTime() > now.getTime()) {
+    moment.setDate(moment.getDate() - 1);
+  }
+  return moment;
+};
+
+/**
  * The next occurrence of the daily update hour strictly after `now`.
  */
 export const nextDailyUpdate = (now: Date, hour: number): Date => {

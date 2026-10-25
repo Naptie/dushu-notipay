@@ -3,7 +3,7 @@ import { getRoomBalance } from '../api/dushu.js';
 import { withTokenRefresh } from '../core/auth.js';
 import { db, scheduler, type UserPublic } from '../core/database.js';
 import { DATA_COLLECTION_BATCH_SIZE, DAILY_UPDATE_HOUR } from '../core/constants.js';
-import { dailyUpdateMoment, formatLocalTimestamp, parseLocalTimestamp } from '../core/time.js';
+import { lastDailySlot, formatLocalTimestamp, parseLocalTimestamp } from '../core/time.js';
 import { generateBalanceChart } from '../presentation/charts.js';
 import { generateBalanceSummary } from '../presentation/summary.js';
 
@@ -236,14 +236,14 @@ export const sendNotificationForUser = async (
  *
  * The anchor is the moment of the user's last successful daily update, or the
  * moment they bound when they have never been updated. The update is due as
- * soon as the daily slot of the current day has been reached while the anchor
- * still points at an earlier moment. This keeps one history point per day and
- * catches up automatically when the process was down at the daily slot.
+ * soon as a daily slot has been reached that the anchor does not cover yet.
+ * This keeps one history point per day and catches up automatically when the
+ * process was down at the daily slot.
  */
-const isDailyUpdateDue = (user: UserPublic, dailyMoment: Date): boolean => {
+const isDailyUpdateDue = (user: UserPublic, slot: Date): boolean => {
   try {
     const anchor = parseLocalTimestamp(user.last_login ?? user.created_at);
-    return anchor.getTime() < dailyMoment.getTime();
+    return anchor.getTime() < slot.getTime();
   } catch (error) {
     console.error(`[Scheduler] Error checking daily update for ${user.qq_id}:`, error);
     return false;
@@ -270,16 +270,17 @@ export const runHourlyTasks = async (napcat: NCWebsocket, scheduledHour: number)
       return;
     }
 
-    // The daily slot of the current day. History rows are pinned to this
-    // moment, so a run that is caught up late still lands on the daily grid.
-    const dailyMoment = dailyUpdateMoment(now, DAILY_UPDATE_HOUR);
-    const dailySlotReached = scheduledHour >= DAILY_UPDATE_HOUR;
+    // The daily slot the readings belong to: the most recent one at or before
+    // now. A run that happens late (e.g. after downtime) is still recorded on
+    // the daily grid, and a reading taken before the daily hour closes the
+    // previous day.
+    const slot = lastDailySlot(now, DAILY_UPDATE_HOUR);
 
     const tasks: CollectTask[] = [];
 
     for (const user of allUsers) {
       const notifications = scheduler.getNotificationsAtHourForUser(user.qq_id, scheduledHour);
-      const isDaily = dailySlotReached && isDailyUpdateDue(user, dailyMoment);
+      const isDaily = isDailyUpdateDue(user, slot);
 
       if (!isDaily && notifications.length === 0) {
         continue;
@@ -296,7 +297,7 @@ export const runHourlyTasks = async (napcat: NCWebsocket, scheduledHour: number)
         // Only the daily update writes history; notification runs report live
         // balances so the chart keeps exactly one point per day.
         persist: isDaily,
-        recordedAt: isDaily ? formatLocalTimestamp(dailyMoment) : undefined
+        recordedAt: isDaily ? formatLocalTimestamp(slot) : undefined
       });
     }
 

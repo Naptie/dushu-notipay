@@ -105,6 +105,50 @@ export const generateBalanceChart = async (
 };
 
 /**
+ * Tick callback that labels the axis with dates only.
+ *
+ * The daily update is pinned to a single hour, so the axis carries no time
+ * information any more: every calendar day is labelled with its date exactly
+ * once. The label is placed on the tick closest to the update hour, which
+ * keeps it next to the point it describes.
+ */
+const createDateTickCallback =
+  (dataHour: number) =>
+  (value: number | string, index: number, ticks: { value: number }[]): string | null => {
+    const date = new Date(value);
+    const dateLabel = date.toLocaleDateString('zh-CN', {
+      month: '2-digit',
+      day: '2-digit'
+    });
+
+    // Find the tick of the same day that sits closest to the update hour.
+    let labelIndex = index;
+    let bestDistance = Number.POSITIVE_INFINITY;
+
+    for (let i = 0; i < ticks.length; i++) {
+      const tick = ticks[i];
+      if (tick?.value === undefined || tick.value === null) {
+        continue;
+      }
+      const tickDate = new Date(tick.value);
+      if (
+        tickDate.getFullYear() !== date.getFullYear() ||
+        tickDate.getMonth() !== date.getMonth() ||
+        tickDate.getDate() !== date.getDate()
+      ) {
+        continue;
+      }
+      const distance = Math.abs(tickDate.getHours() - dataHour);
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        labelIndex = i;
+      }
+    }
+
+    return index === labelIndex ? dateLabel : null;
+  };
+
+/**
  * Create a chart configuration with time scale
  */
 export const createChartConfig = (
@@ -112,21 +156,8 @@ export const createChartConfig = (
   title: string,
   totalPoints: number
 ): ChartConfiguration => {
-  let hourInterval;
-  if (totalPoints < 48) {
-    hourInterval = 1;
-  } else if (totalPoints < 72) {
-    hourInterval = 2;
-  } else if (totalPoints < 96) {
-    hourInterval = 4;
-  } else if (totalPoints < 144) {
-    hourInterval = 6;
-  } else {
-    hourInterval = 8;
-  }
-
   const lastPoint = series[series.length - 1];
-  const lastHour = new Date(lastPoint.x).getHours();
+  const dataHour = new Date(lastPoint.x).getHours();
 
   return {
     type: 'line',
@@ -168,6 +199,22 @@ export const createChartConfig = (
               family: CHART_FONT_STACK
             }
           }
+        },
+        tooltip: {
+          callbacks: {
+            // The axis carries dates only, so the tooltip does as well.
+            title: (items) => {
+              const item = items[0];
+              const x = item?.parsed.x;
+              if (!item || x === null || x === undefined) {
+                return '';
+              }
+              return new Date(x).toLocaleDateString('zh-CN', {
+                month: '2-digit',
+                day: '2-digit'
+              });
+            }
+          }
         }
       },
       scales: {
@@ -190,7 +237,7 @@ export const createChartConfig = (
           type: 'time',
           title: {
             display: true,
-            text: '时间',
+            text: '日期',
             font: {
               family: CHART_FONT_STACK
             }
@@ -201,39 +248,7 @@ export const createChartConfig = (
             font: {
               family: CHART_FONT_STACK
             },
-            callback: function (value, index, ticks) {
-              const date = new Date(value);
-
-              const dateLabel = date.toLocaleDateString('zh-CN', {
-                month: '2-digit',
-                day: '2-digit'
-              });
-
-              const hour = date.getHours();
-              const minute = date.getMinutes();
-              const timeLabel = `${hour.toString().padStart(2, '0')}:${minute.toString().padStart(2, '0')}`;
-
-              if (index === ticks.length - 1) {
-                return hour === 0 ? dateLabel : timeLabel;
-              }
-
-              if (index >= ticks.length - hourInterval) {
-                const hourDiff = Math.abs(lastHour - hour);
-                if (hourDiff < hourInterval / 2) {
-                  return null;
-                }
-              }
-
-              if (hour === 0) {
-                return dateLabel;
-              }
-
-              if (hour % hourInterval === 0) {
-                return timeLabel;
-              }
-
-              return null;
-            },
+            callback: createDateTickCallback(dataHour),
             autoSkip: false // Disable auto-skipping to use custom callback
           }
         }
