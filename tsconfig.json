@@ -11,5 +11,5 @@
     "outDir": "./dist",
     "rootDir": "./src"
   },
-  "exclude": ["node_modules", "scripts", "dist"]
+  "exclude": ["node_modules", "scripts", "dist", "tmp"]
 }

@@ -5,7 +5,6 @@ import { fileURLToPath } from 'url';
 import { config } from './config.js';
 import { encryptionService } from './encryption.js';
 import { NotificationScheduler } from './scheduler.js';
-import { DEFAULT_FETCH_INTERVAL } from './constants.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -18,7 +17,6 @@ export interface UserPublic {
   qq_id: string;
   user_id: string | null;
   name: string | null;
-  fetch_interval: string;
   created_at: string;
   updated_at: string;
   last_login: string | null;
@@ -75,14 +73,12 @@ class UserDatabase {
         salt TEXT NOT NULL,
         user_id TEXT,
         name TEXT,
-        fetch_interval TEXT DEFAULT '${DEFAULT_FETCH_INTERVAL}',
         access_token TEXT,
         created_at TEXT DEFAULT (datetime('now', 'localtime')),
         updated_at TEXT DEFAULT (datetime('now', 'localtime')),
         last_login TEXT
       )
     `;
-
     const createRoomsTableSQL = `
       CREATE TABLE IF NOT EXISTS rooms (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -176,7 +172,7 @@ class UserDatabase {
    */
   getUser(qqId: string): UserPublic | null {
     const stmt = this.db.prepare(`
-      SELECT id, qq_id, user_id, name, fetch_interval, created_at, updated_at, last_login
+      SELECT id, qq_id, user_id, name, created_at, updated_at, last_login
       FROM users
       WHERE qq_id = ?
     `);
@@ -245,28 +241,19 @@ class UserDatabase {
   }
 
   /**
-   * Update last login timestamp
+   * Update the timestamp of the last successful daily update.
+   *
+   * `at` pins the moment to the scheduled daily slot (see DAILY_UPDATE_HOUR) so
+   * a catch-up run after downtime still advances the scheduler by exactly one
+   * day. Defaults to "now".
    */
-  updateLastLogin(qqId: string): void {
+  updateLastLogin(qqId: string, at?: string): void {
     const stmt = this.db.prepare(`
       UPDATE users
-      SET last_login = datetime('now', 'localtime')
+      SET last_login = COALESCE(?, datetime('now', 'localtime'))
       WHERE qq_id = ?
     `);
-    stmt.run(qqId);
-  }
-
-  /**
-   * Update fetch interval
-   */
-  updateFetchInterval(qqId: string, fetchInterval: string): void {
-    const stmt = this.db.prepare(`
-      UPDATE users
-      SET fetch_interval = ?,
-          updated_at = datetime('now', 'localtime')
-      WHERE qq_id = ?
-    `);
-    stmt.run(fetchInterval, qqId);
+    stmt.run(at ?? null, qqId);
   }
 
   /**
@@ -283,7 +270,7 @@ class UserDatabase {
    */
   getAllUsers(): UserPublic[] {
     const stmt = this.db.prepare(`
-      SELECT id, qq_id, user_id, name, fetch_interval, created_at, updated_at, last_login
+      SELECT id, qq_id, user_id, name, created_at, updated_at, last_login
       FROM users
       ORDER BY created_at DESC
     `);
@@ -343,14 +330,44 @@ class UserDatabase {
   }
 
   /**
-   * Add a billing history record
+   * Add a billing history record.
+   *
+   * `recordedAt` pins the timestamp of the row. The daily update passes the
+   * scheduled slot so that a catch-up run (after downtime) still lands on the
+   * daily grid. When it is given, any existing row of the same room for the
+   * same calendar day is replaced, which keeps the history at exactly one
+   * point per day even if a row was written at an unusual time before.
    */
-  addBillingHistory(qqId: string, roomUid: string, balance: number, roomLabel?: string): void {
-    const stmt = this.db.prepare(`
-      INSERT INTO billing_history (qq_id, room_uid, balance, room_label)
-      VALUES (?, ?, ?, ?)
+  addBillingHistory(
+    qqId: string,
+    roomUid: string,
+    balance: number,
+    roomLabel?: string,
+    recordedAt?: string
+  ): void {
+    const insert = this.db.prepare(`
+      INSERT INTO billing_history (qq_id, room_uid, balance, room_label, recorded_at)
+      VALUES (?, ?, ?, ?, COALESCE(?, datetime('now', 'localtime')))
     `);
-    stmt.run(qqId, roomUid, balance, roomLabel ?? null);
+
+    const write = (): void => {
+      insert.run(qqId, roomUid, balance, roomLabel ?? null, recordedAt ?? null);
+    };
+
+    if (recordedAt === undefined) {
+      write();
+      return;
+    }
+
+    this.db.transaction(() => {
+      this.db
+        .prepare(
+          `DELETE FROM billing_history
+           WHERE qq_id = ? AND room_uid = ? AND substr(recorded_at, 1, 10) = substr(?, 1, 10)`
+        )
+        .run(qqId, roomUid, recordedAt);
+      write();
+    })();
   }
 
   /**
@@ -437,7 +454,11 @@ class UserDatabase {
 
   /**
    * Get the balance change over the last 24 hours for a room.
-   * Falls back to the earliest known record if none exists from 24h ago.
+   *
+   * The comparison is made against the latest record itself (the record at
+   * least 24 hours before it) instead of against "now", so a daily grid that
+   * is updated at a fixed hour always reports a day-over-day difference.
+   * Falls back to the earliest known record if none exists.
    */
   getBalance24hChange(qqId: string, roomUid: string): BalanceChange | null {
     const currentRecord = this.getLatestBilling(qqId, roomUid);
@@ -448,11 +469,12 @@ class UserDatabase {
     const prevStmt = this.db.prepare(`
       SELECT balance FROM billing_history
       WHERE qq_id = ? AND room_uid = ?
-        AND datetime(recorded_at) <= datetime('now', 'localtime', '-1 day')
+        AND datetime(recorded_at) <= datetime(?, '-1 day')
       ORDER BY recorded_at DESC
       LIMIT 1
     `);
-    let prevRecord = prevStmt.get(qqId, roomUid) as { balance: number } | undefined;
+    let prevRecord = prevStmt.get(qqId, roomUid, currentRecord.recorded_at) as
+      { balance: number } | undefined;
 
     if (!prevRecord) {
       const firstStmt = this.db.prepare(`

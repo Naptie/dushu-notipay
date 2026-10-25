@@ -2,8 +2,8 @@ import type { NCWebsocket, SendMessageSegment } from 'node-napcat-ts';
 import { getRoomBalance } from '../api/dushu.js';
 import { withTokenRefresh } from '../core/auth.js';
 import { db, scheduler, type UserPublic } from '../core/database.js';
-import { DATA_COLLECTION_BATCH_SIZE, DEFAULT_FETCH_INTERVAL } from '../core/constants.js';
-import { calculateNextFetchTime, parseRelativeTime } from '../core/time.js';
+import { DATA_COLLECTION_BATCH_SIZE, DAILY_UPDATE_HOUR } from '../core/constants.js';
+import { dailyUpdateMoment, formatLocalTimestamp, parseLocalTimestamp } from '../core/time.js';
 import { generateBalanceChart } from '../presentation/charts.js';
 import { generateBalanceSummary } from '../presentation/summary.js';
 
@@ -22,12 +22,27 @@ export interface CollectedData {
 }
 
 /**
+ * One unit of work for the collector.
+ *
+ * `persist` decides whether the fetched balances are written to the billing
+ * history. Only the daily update persists; notification runs fetch live
+ * balances without touching the history, so the chart keeps exactly one point
+ * per day. `recordedAt` pins the timestamp of the written row to the
+ * scheduled daily slot.
+ */
+export interface CollectTask {
+  user: UserPublic;
+  persist: boolean;
+  recordedAt?: string;
+}
+
+/**
  * Fetch fresh balances for every room bound to a user, recording each value
  * into the billing history. Handles token minting/refresh automatically.
  */
 export const collectUserData = async (
   user: UserPublic,
-  options: { persist?: boolean } = {}
+  options: { persist?: boolean; recordedAt?: string } = {}
 ): Promise<CollectedData> => {
   const persist = options.persist ?? true;
   const rooms = db.getRooms(user.qq_id);
@@ -47,7 +62,13 @@ export const collectUserData = async (
       for (const room of rooms) {
         const balance = await getRoomBalance(token, room.apartment_id, room.room_uid);
         if (persist) {
-          db.addBillingHistory(user.qq_id, room.room_uid, balance, room.room_label ?? undefined);
+          db.addBillingHistory(
+            user.qq_id,
+            room.room_uid,
+            balance,
+            room.room_label ?? undefined,
+            options.recordedAt
+          );
         }
         results.push({
           roomUid: room.room_uid,
@@ -59,7 +80,7 @@ export const collectUserData = async (
     });
 
     if (persist) {
-      db.updateLastLogin(user.qq_id);
+      db.updateLastLogin(user.qq_id, options.recordedAt);
     }
     console.log(
       `[Scheduler] Collected data for ${user.name || user.qq_id} (${collected.length} rooms)`
@@ -81,24 +102,26 @@ export const collectUserData = async (
  * Collect users in parallel batches
  */
 export const collectData = async (
-  users: UserPublic[],
+  tasks: CollectTask[],
   batchSize: number = DATA_COLLECTION_BATCH_SIZE
 ): Promise<CollectedData[]> => {
   const results: CollectedData[] = [];
 
-  for (let i = 0; i < users.length; i += batchSize) {
-    const batch = users.slice(i, i + batchSize);
+  for (let i = 0; i < tasks.length; i += batchSize) {
+    const batch = tasks.slice(i, i + batchSize);
     console.log(
-      `[Scheduler] Processing batch ${Math.floor(i / batchSize) + 1}/${Math.ceil(users.length / batchSize)} (${batch.length} users)`
+      `[Scheduler] Processing batch ${Math.floor(i / batchSize) + 1}/${Math.ceil(tasks.length / batchSize)} (${batch.length} users)`
     );
 
     const batchResults = await Promise.all(
-      batch.map((user) => collectUserData(user, { persist: true }))
+      batch.map((task) =>
+        collectUserData(task.user, { persist: task.persist, recordedAt: task.recordedAt })
+      )
     );
     results.push(...batchResults);
 
     // Small delay between batches to avoid overwhelming the server
-    if (i + batchSize < users.length) {
+    if (i + batchSize < tasks.length) {
       await new Promise((resolve) => setTimeout(resolve, 1000));
     }
   }
@@ -153,7 +176,7 @@ const buildReportSegments = async (
  */
 export const sendNotificationForUser = async (
   collected: CollectedData,
-  currentHour: number,
+  scheduledHour: number,
   napcat: NCWebsocket
 ): Promise<void> => {
   if (!collected.success) {
@@ -163,7 +186,7 @@ export const sendNotificationForUser = async (
     return;
   }
 
-  const notifications = scheduler.getNotificationsAtHourForUser(collected.qqId, currentHour);
+  const notifications = scheduler.getNotificationsAtHourForUser(collected.qqId, scheduledHour);
 
   for (const notification of notifications) {
     try {
@@ -208,32 +231,36 @@ export const sendNotificationForUser = async (
   }
 };
 
-const isFetchDue = (user: UserPublic, now: Date): boolean => {
+/**
+ * Decide whether the daily update is still pending for a user.
+ *
+ * The anchor is the moment of the user's last successful daily update, or the
+ * moment they bound when they have never been updated. The update is due as
+ * soon as the daily slot of the current day has been reached while the anchor
+ * still points at an earlier moment. This keeps one history point per day and
+ * catches up automatically when the process was down at the daily slot.
+ */
+const isDailyUpdateDue = (user: UserPublic, dailyMoment: Date): boolean => {
   try {
-    const intervalHours = parseRelativeTime(user.fetch_interval || DEFAULT_FETCH_INTERVAL);
-    const nextFetchTime = calculateNextFetchTime(
-      user.last_login ?? undefined,
-      user.created_at,
-      intervalHours
-    );
-
-    // Check if current time is at or after the scheduled fetch time
-    // We use a small buffer (5 mins) to handle slight timing differences
-    return now.getTime() >= nextFetchTime.getTime() - 5 * 60 * 1000;
+    const anchor = parseLocalTimestamp(user.last_login ?? user.created_at);
+    return anchor.getTime() < dailyMoment.getTime();
   } catch (error) {
-    console.error(`[Scheduler] Error checking interval for ${user.qq_id}:`, error);
+    console.error(`[Scheduler] Error checking daily update for ${user.qq_id}:`, error);
     return false;
   }
 };
 
 /**
- * Run the hourly collection + notification cycle
+ * Run the hourly collection + notification cycle.
+ *
+ * `scheduledHour` is the hour of day (0-23) the tick was scheduled for. The
+ * timer tracks it explicitly instead of deriving it from the wall clock, so a
+ * tick that runs late cannot be attributed to the next hour.
  */
-export const runHourlyTasks = async (napcat: NCWebsocket): Promise<void> => {
+export const runHourlyTasks = async (napcat: NCWebsocket, scheduledHour: number): Promise<void> => {
   try {
     const now = new Date();
-    const currentHour = now.getMinutes() >= 30 ? (now.getHours() + 1) % 24 : now.getHours();
-    console.log(`[Scheduler] Running for hour: ${currentHour}`);
+    console.log(`[Scheduler] Running for hour: ${scheduledHour}`);
 
     const allUsers = db.getAllUsers();
     console.log(`[Scheduler] Checking ${allUsers.length} users`);
@@ -243,38 +270,43 @@ export const runHourlyTasks = async (napcat: NCWebsocket): Promise<void> => {
       return;
     }
 
-    const usersToFetch: UserPublic[] = [];
+    // The daily slot of the current day. History rows are pinned to this
+    // moment, so a run that is caught up late still lands on the daily grid.
+    const dailyMoment = dailyUpdateMoment(now, DAILY_UPDATE_HOUR);
+    const dailySlotReached = scheduledHour >= DAILY_UPDATE_HOUR;
+
+    const tasks: CollectTask[] = [];
 
     for (const user of allUsers) {
-      let shouldFetch = false;
+      const notifications = scheduler.getNotificationsAtHourForUser(user.qq_id, scheduledHour);
+      const isDaily = dailySlotReached && isDailyUpdateDue(user, dailyMoment);
 
-      // (a) scheduled notification due at this hour
-      const notifications = scheduler.getNotificationsAtHourForUser(user.qq_id, currentHour);
-      if (notifications.length > 0) {
-        shouldFetch = true;
-        console.log(`[Scheduler] Fetching for ${user.qq_id} due to scheduled notification`);
+      if (!isDaily && notifications.length === 0) {
+        continue;
       }
 
-      // (b) fetch interval elapsed
-      if (!shouldFetch && isFetchDue(user, now)) {
-        shouldFetch = true;
-        console.log(
-          `[Scheduler] Fetching for ${user.qq_id} due to interval (${user.fetch_interval})`
-        );
-      }
+      console.log(
+        isDaily
+          ? `[Scheduler] Fetching for ${user.qq_id} due to daily update`
+          : `[Scheduler] Fetching for ${user.qq_id} due to scheduled notification`
+      );
 
-      if (shouldFetch) {
-        usersToFetch.push(user);
-      }
+      tasks.push({
+        user,
+        // Only the daily update writes history; notification runs report live
+        // balances so the chart keeps exactly one point per day.
+        persist: isDaily,
+        recordedAt: isDaily ? formatLocalTimestamp(dailyMoment) : undefined
+      });
     }
 
-    if (usersToFetch.length === 0) {
+    if (tasks.length === 0) {
       console.log('[Scheduler] No users need fetching this hour');
       return;
     }
 
-    console.log(`[Scheduler] Phase 1: Collecting data for ${usersToFetch.length} users...`);
-    const collectedData = await collectData(usersToFetch);
+    console.log(`[Scheduler] Phase 1: Collecting data for ${tasks.length} users...`);
+    const collectedData = await collectData(tasks);
     const successCount = collectedData.filter((d) => d.success).length;
     const failureCount = collectedData.length - successCount;
     console.log(
@@ -283,7 +315,7 @@ export const runHourlyTasks = async (napcat: NCWebsocket): Promise<void> => {
 
     console.log('[Scheduler] Phase 2: Sending notifications...');
     for (const data of collectedData) {
-      await sendNotificationForUser(data, currentHour, napcat);
+      await sendNotificationForUser(data, scheduledHour, napcat);
     }
 
     console.log('[Scheduler] Hourly tasks completed');
@@ -293,7 +325,42 @@ export const runHourlyTasks = async (napcat: NCWebsocket): Promise<void> => {
 };
 
 let hourlyTimeout: NodeJS.Timeout | null = null;
-let hourlyInterval: NodeJS.Timeout | null = null;
+
+/** Hour of day (0-23) the pending tick is scheduled for. */
+let scheduledHour = 0;
+
+/**
+ * Milliseconds until the next top of the hour
+ */
+const msUntilNextHour = (now: Date): number => {
+  const target = new Date(now);
+  target.setHours(target.getHours() + 1, 0, 0, 0);
+  return target.getTime() - now.getTime();
+};
+
+/**
+ * Schedule the next tick for the upcoming top of the hour.
+ *
+ * The next tick is armed after the current one finished, so a slow run can
+ * never make the timer drift across an hour boundary.
+ */
+const scheduleNextTick = (napcat: NCWebsocket): void => {
+  const now = new Date();
+  const delay = msUntilNextHour(now);
+  scheduledHour = (now.getHours() + 1) % 24;
+  const hour = scheduledHour;
+
+  console.log(
+    `[Scheduler] Next run at ${String(hour).padStart(2, '0')}:00 (in ${Math.round(delay / 1000 / 60)} minutes)`
+  );
+
+  hourlyTimeout = setTimeout(() => {
+    void (async () => {
+      await runHourlyTasks(napcat, hour);
+      scheduleNextTick(napcat);
+    })();
+  }, delay);
+};
 
 /**
  * Start the hourly timer (runs on the hour, every hour)
@@ -302,23 +369,13 @@ export const startHourlyTimer = (napcat: NCWebsocket): void => {
   stopHourlyTimer();
 
   const now = new Date();
-  const minutes = now.getMinutes();
-  const seconds = now.getSeconds();
-  const milliseconds = now.getMilliseconds();
-
-  const delayUntilNextHour = (60 - minutes - 1) * 60 * 1000 + (60 - seconds) * 1000 - milliseconds;
+  const delayUntilNextHour = msUntilNextHour(now);
 
   console.log(
     `[Scheduler] Will start in ${Math.round(delayUntilNextHour / 1000 / 60)} minutes (at next hour)`
   );
 
-  hourlyTimeout = setTimeout(() => {
-    runHourlyTasks(napcat);
-
-    hourlyInterval = setInterval(() => runHourlyTasks(napcat), 60 * 60 * 1000);
-    hourlyTimeout = null;
-    console.log('[Scheduler] Timer started (runs every hour on the hour)');
-  }, delayUntilNextHour);
+  scheduleNextTick(napcat);
 };
 
 /**
@@ -329,10 +386,5 @@ export const stopHourlyTimer = (): void => {
     clearTimeout(hourlyTimeout);
     hourlyTimeout = null;
     console.log('[Scheduler] Pending timer cleared');
-  }
-  if (hourlyInterval) {
-    clearInterval(hourlyInterval);
-    hourlyInterval = null;
-    console.log('[Scheduler] Timer stopped');
   }
 };

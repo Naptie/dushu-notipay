@@ -1,14 +1,8 @@
 import type { NCWebsocket, SendMessageSegment } from 'node-napcat-ts';
 import { validateOpenId, AuthError } from '../core/auth.js';
 import { db, scheduler } from '../core/database.js';
-import { APP_NAME, DEFAULT_FETCH_INTERVAL, GITHUB_LINK } from '../core/constants.js';
-import {
-  calculateNextFetchTime,
-  formatLocalShort,
-  parseRelativeTime,
-  parseTimeParameter,
-  roundUpToNextHour
-} from '../core/time.js';
+import { APP_NAME, DAILY_UPDATE_HOUR, GITHUB_LINK } from '../core/constants.js';
+import { formatLocalShort, nextDailyUpdate, parseTimeParameter } from '../core/time.js';
 import { generateBalanceChart } from '../presentation/charts.js';
 import { generateBalanceSummary } from '../presentation/summary.js';
 import { collectUserData } from './tasks.js';
@@ -80,9 +74,7 @@ const handleHelp = async ({ command, send }: CommandContext): Promise<void> => {
     '   不设阈值则每天该时间必定发送。\n\n' +
     '7. 取消定时通知：\n' +
     `${command} unnotify\n\n` +
-    '8. 设置更新间隔：\n' +
-    `${command} interval [时间间隔]\n` +
-    `   例：${command} interval 12h\n\n` +
+    `账单历史每天 ${DAILY_UPDATE_HOUR}:00 自动更新一次。\n\n` +
     '尖括号 <> 表示必填参数，中括号 [] 表示可选参数。\n' +
     '如有其他疑问，请联系管理员。\n' +
     `当前 commit：${commitHash}\n` +
@@ -163,16 +155,8 @@ const handleBind = async ({
   const roomLines = rooms.map((room) => `- ${room.roomLabel}`).join('\n');
   let message = `成功绑定到 ${identity.name || identity.userId}，共 ${rooms.length} 个房间：\n${roomLines}`;
 
-  const user = db.getUser(qqId);
-  if (user) {
-    try {
-      const hours = parseRelativeTime(user.fetch_interval || DEFAULT_FETCH_INTERVAL);
-      const firstFetch = roundUpToNextHour(new Date(Date.now() + hours * 60 * 60 * 1000));
-      message += `\n首次自动更新将在 ${formatLocalShort(firstFetch)} 进行（间隔：${user.fetch_interval}）。`;
-    } catch {
-      // Ignore error in message generation
-    }
-  }
+  const nextUpdate = nextDailyUpdate(new Date(), DAILY_UPDATE_HOUR);
+  message += `\n账单历史每天 ${DAILY_UPDATE_HOUR}:00 自动更新，下次更新：${formatLocalShort(nextUpdate)}。`;
 
   await send(message);
 };
@@ -379,66 +363,6 @@ const handleUnnotify = async ({
   }
 };
 
-const handleInterval = async ({ command, params, qqId, send }: CommandContext): Promise<void> => {
-  const user = db.getUser(qqId);
-  if (!user) {
-    await send(`您还未绑定账号。请私聊发送：${command} bind 查看绑定方法。`);
-    return;
-  }
-
-  if (params.length === 0) {
-    let message = `当前自动更新间隔：${user.fetch_interval || DEFAULT_FETCH_INTERVAL}`;
-    try {
-      const hours = parseRelativeTime(user.fetch_interval || DEFAULT_FETCH_INTERVAL);
-      let nextFetch = calculateNextFetchTime(user.last_login ?? undefined, user.created_at, hours);
-      if (nextFetch < new Date()) {
-        // The scheduler will pick it up at the next hour
-        nextFetch = roundUpToNextHour(new Date());
-      }
-      message += `\n下次自动更新将在 ${formatLocalShort(nextFetch)} 进行。`;
-    } catch {
-      // Ignore error
-    }
-    await send(message);
-    return;
-  }
-
-  if (params.length === 1) {
-    const intervalStr = params[0];
-    try {
-      const hours = parseRelativeTime(intervalStr);
-      if (hours < 1) {
-        await send('间隔时间不能小于 1 小时。');
-        return;
-      }
-
-      db.updateFetchInterval(qqId, intervalStr);
-
-      let message = `已设置自动更新间隔为：${intervalStr}（${hours} 小时）。`;
-
-      const updated = db.getUser(qqId);
-      if (updated) {
-        let nextFetch = calculateNextFetchTime(
-          updated.last_login ?? undefined,
-          updated.created_at,
-          hours
-        );
-        if (nextFetch < new Date()) {
-          nextFetch = roundUpToNextHour(new Date());
-        }
-        message += `\n下次自动更新将在 ${formatLocalShort(nextFetch)} 进行。`;
-      }
-
-      await send(message);
-    } catch {
-      await send('时间格式不正确。示例：1d, 12h');
-    }
-    return;
-  }
-
-  await send(`用法：${command} interval [时间间隔]`);
-};
-
 /**
  * Route a parsed command to its handler.
  * Unknown subcommands fall back to the help text.
@@ -464,9 +388,6 @@ export const dispatchCommand = async (ctx: CommandContext): Promise<void> => {
       break;
     case 'unnotify':
       await handleUnnotify(ctx);
-      break;
-    case 'interval':
-      await handleInterval({ ...ctx, params });
       break;
     case 'help':
       await handleHelp(ctx);

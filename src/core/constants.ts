@@ -25,7 +25,16 @@ export const RECHARGE_TEAM = '水电充值';
  */
 export const BALANCE_MASK = '--';
 
-export const DEFAULT_FETCH_INTERVAL = '1d';
+/**
+ * Hour of day (server local time, UTC+8) at which the daily billing update
+ * runs for every user.
+ *
+ * The upstream billing system refreshes its own data around 08:00-09:00, so
+ * the update is pinned to a fixed constant hour instead of being anchored to
+ * the moment each user happened to bind. A constant slot keeps the history
+ * on a uniform daily grid (one point per day, always at the same time).
+ */
+export const DAILY_UPDATE_HOUR = 10;
 
 /** Minimum balance change considered "spent" when reporting */
 export const API_TIMEOUT_MS = 15_000;

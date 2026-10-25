@@ -10,11 +10,11 @@ const commands = {
   list: () => {
     const users = db.getAllUsers();
     console.log(`\nTotal users: ${users.length}\n`);
-    console.log('ID\tQQ ID\t\tUser ID\t\tName\t\tInterval\tLast Fetch');
+    console.log('ID\tQQ ID\t\tUser ID\t\tName\t\tLast Update');
     console.log('─'.repeat(100));
     users.forEach((u) => {
       console.log(
-        `${u.id}\t${u.qq_id}\t${u.user_id ?? 'N/A'}\t${u.name ?? 'N/A'}\t${u.fetch_interval}\t${u.last_login ?? 'Never'}`
+        `${u.id}\t${u.qq_id}\t${u.user_id ?? 'N/A'}\t${u.name ?? 'N/A'}\t${u.last_login ?? 'Never'}`
       );
     });
     console.log();

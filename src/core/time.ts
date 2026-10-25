@@ -31,27 +31,59 @@ export const parseRelativeTime = (param: string): number => {
 };
 
 /**
- * Calculate the next fetch time based on last login or creation time and interval
+ * Parse a local-time timestamp string ("YYYY-MM-DD HH:MM:SS") into a Date.
+ *
+ * Timestamps are stored in the server's local timezone (UTC+8) by SQLite's
+ * `datetime('now', 'localtime')`, so they are parsed back field by field
+ * instead of relying on the engine's interpretation of a non-ISO string.
  */
-export const calculateNextFetchTime = (
-  lastLogin: string | undefined,
-  createdAt: string,
-  intervalHours: number
-): Date => {
-  let baseTime: Date;
-  if (lastLogin) {
-    // If fetched before, use last fetch time rounded to nearest hour
-    baseTime = new Date(lastLogin);
-  } else {
-    // If never fetched, use creation time rounded to nearest hour
-    baseTime = new Date(createdAt);
+export const parseLocalTimestamp = (value: string): Date => {
+  const match = value.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?$/);
+  if (!match) {
+    throw new Error(`Invalid local timestamp: ${value}`);
   }
-  if (baseTime.getMinutes() >= 30) {
-    baseTime.setHours(baseTime.getHours() + 1);
-  }
-  baseTime.setMinutes(0, 0, 0);
 
-  return new Date(baseTime.getTime() + intervalHours * 60 * 60 * 1000);
+  const [, year, month, day, hour, minute, second] = match;
+  return new Date(
+    Number(year),
+    Number(month) - 1,
+    Number(day),
+    Number(hour),
+    Number(minute),
+    Number(second ? Number(second) : 0)
+  );
+};
+
+/**
+ * Format a Date as a local-time database timestamp ("YYYY-MM-DD HH:MM:SS")
+ */
+export const formatLocalTimestamp = (date: Date): string => {
+  const pad = (value: number): string => String(value).padStart(2, '0');
+  return (
+    `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ` +
+    `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+  );
+};
+
+/**
+ * The moment of the daily update on the same calendar day as `now`
+ * (i.e. today at `hour:00`, server local time).
+ */
+export const dailyUpdateMoment = (now: Date, hour: number): Date => {
+  const moment = new Date(now);
+  moment.setHours(hour, 0, 0, 0);
+  return moment;
+};
+
+/**
+ * The next occurrence of the daily update hour strictly after `now`.
+ */
+export const nextDailyUpdate = (now: Date, hour: number): Date => {
+  const moment = dailyUpdateMoment(now, hour);
+  if (moment.getTime() <= now.getTime()) {
+    moment.setDate(moment.getDate() + 1);
+  }
+  return moment;
 };
 
 /**
@@ -162,16 +194,4 @@ export const parseTimeParameter = (param: string): Date => {
  */
 export const formatLocalShort = (date: Date): string => {
   return `${date.getMonth() + 1}月${date.getDate()}日 ${date.getHours()}:${String(date.getMinutes()).padStart(2, '0')}`;
-};
-
-/**
- * Round a Date up to the next top of the hour (as the scheduler would interpret it)
- */
-export const roundUpToNextHour = (date: Date): Date => {
-  const result = new Date(date);
-  if (result.getMinutes() > 0 || result.getSeconds() > 0 || result.getMilliseconds() > 0) {
-    result.setHours(result.getHours() + 1);
-  }
-  result.setMinutes(0, 0, 0);
-  return result;
 };
