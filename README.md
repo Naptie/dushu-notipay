@@ -106,6 +106,26 @@ pnpm start          # 生产（需先 build）
 pnpm dev            # 开发热重载
 ```
 
+### 以 pm2 常驻（mac）
+
+```bash
+pm2 start dist/index.js --name dushu-notipay --interpreter /opt/homebrew/bin/node --cwd /Users/naptie/dushu-notipay
+pm2 save            # 重要：机器重启后 pm2 resurrect 依赖这份 dump
+```
+
+注意事项：
+
+- `better-sqlite3` 与 `canvas` 是原生模块。升级 Node 后必须重新编译，否则进程会因 `ERR_DLOPEN_FAILED` 反复崩溃：
+
+  ```bash
+  pnpm rebuild better-sqlite3 canvas
+  codesign --force --sign - node_modules/.pnpm/canvas@*/node_modules/canvas/build/Release/canvas.node
+  ```
+
+  `canvas` 的预编译包在重装时会覆盖写入，导致原有代码签名失效，macOS 会在 dlopen 时直接杀掉进程（`SIGKILL (Code Signature Invalid)`），因此重装后需要重新签名。
+
+- `napcatWs` 指向服务器的 Tailscale 地址。Tailscale 掉线时 Bot 收不到任何消息，但进程不会退出，会自动重连；恢复后自动继续。
+
 ## 代理配置
 
 如果需要通过代理访问网络，可以设置以下环境变量：
